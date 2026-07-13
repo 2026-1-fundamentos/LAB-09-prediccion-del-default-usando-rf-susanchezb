@@ -100,187 +100,131 @@ import pickle
 
 import pandas as pd
 from sklearn.compose import ColumnTransformer
-from sklearn.model_selection import GridSearchCV
-from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import (
+    balanced_accuracy_score,
+    confusion_matrix,
+    f1_score,
+    precision_score,
+    recall_score,
+)
+from sklearn.model_selection import GridSearchCV, StratifiedKFold
 from sklearn.pipeline import Pipeline
-from sklearn.metrics import precision_score, recall_score, f1_score, balanced_accuracy_score, confusion_matrix
+from sklearn.preprocessing import OneHotEncoder
 
 
-def clean_campaign_data():
-    """
-    Paso 1: Limpiar los datasets
-    """
-    # Load data
-    train_data = pd.read_csv("files/input/train_data.csv.zip")
-    test_data = pd.read_csv("files/input/test_data.csv.zip")
+def load_and_clean(filepath):
+    df = pd.read_csv(filepath)
 
-    for idx, data in enumerate([train_data, test_data]):
-        # Rename target column
-        data = data.rename(columns={"default payment next month": "default"})
+    df.rename(
+        columns={"default payment next month": "default"},
+        inplace=True,
+    )
 
-        # Remove ID column
-        data = data.drop("ID", axis=1)
+    df.drop(columns=["ID"], inplace=True)
 
-        # Remove rows with missing values (N/A in MARRIAGE, EDUCATION)
-        data = data[(data["MARRIAGE"] != 0) & (data["EDUCATION"] != 0)]
+    df = df.query("EDUCATION != 0 and MARRIAGE != 0")
 
-        # Group EDUCATION values > 4 as "others" (4 -> 4)
-        data = data.copy()
-        data.loc[data["EDUCATION"] > 4, "EDUCATION"] = 4
+    df["EDUCATION"] = df["EDUCATION"].clip(upper=4)
 
-        if idx == 0:
-            train_data = data
-        else:
-            test_data = data
-
-    return train_data, test_data
+    return df
 
 
-def build_pipeline():
-    """
-    Paso 3: Create pipeline with OneHotEncoder and RandomForest
-    """
-    # Define categorical and numerical columns
-    categorical_cols = ["SEX", "EDUCATION", "MARRIAGE"]
-    numerical_cols = [col for col in ["LIMIT_BAL", "AGE", "PAY_0", "PAY_2", "PAY_3",
-                                       "PAY_4", "PAY_5", "PAY_6", "BILL_AMT1", "BILL_AMT2",
-                                       "BILL_AMT3", "BILL_AMT4", "BILL_AMT5", "BILL_AMT6",
-                                       "PAY_AMT1", "PAY_AMT2", "PAY_AMT3", "PAY_AMT4",
-                                       "PAY_AMT5", "PAY_AMT6"]]
+def main():
+    # Paso 1: Cargar y limpiar datos
+    train_df = load_and_clean("files/input/train_data.csv.zip")
+    test_df = load_and_clean("files/input/test_data.csv.zip")
 
-    # Create preprocessor
+    # Paso 2: Dividir en features y target
+    x_train = train_df.drop(columns=["default"])
+    y_train = train_df["default"]
+    x_test = test_df.drop(columns=["default"])
+    y_test = test_df["default"]
+
+    # Paso 3: Crear pipeline con OneHotEncoder y RandomForestClassifier
+    categorical_features = ["SEX", "EDUCATION", "MARRIAGE"]
+
     preprocessor = ColumnTransformer(
         transformers=[
-            ("cat", OneHotEncoder(sparse_output=False), categorical_cols),
-            ("num", StandardScaler(), numerical_cols)
-        ])
+            ("cat", OneHotEncoder(handle_unknown="ignore"), categorical_features),
+        ],
+        remainder="passthrough",
+    )
 
-    # Create pipeline
-    pipeline = Pipeline(steps=[
-        ("preprocessor", preprocessor),
-        ("classifier", RandomForestClassifier(random_state=42))
-    ])
+    pipeline = Pipeline(
+        steps=[
+            ("preprocessor", preprocessor),
+            ("classifier", RandomForestClassifier(random_state=42)),
+        ]
+    )
 
-    return pipeline
-
-
-def optimize_hyperparameters(pipeline, x_train, y_train):
-    """
-    Paso 4: Optimize hyperparameters using GridSearchCV with balanced_accuracy
-    """
+    # Paso 4: Optimizar hiperparámetros con validación cruzada (10 splits, balanced_accuracy)
     param_grid = {
-        "classifier__n_estimators": [150, 250],
-        "classifier__max_depth": [18, 22],
-        "classifier__min_samples_split": [2, 4]
+        "classifier__n_estimators": [100, 200],
+        "classifier__max_depth": [None, 10],
+        "classifier__min_samples_split": [2, 5],
+        "classifier__min_samples_leaf": [1, 2],
     }
 
+    cv = StratifiedKFold(n_splits=10)
+
     grid_search = GridSearchCV(
-        pipeline,
-        param_grid,
-        cv=10,
+        estimator=pipeline,
+        param_grid=param_grid,
+        cv=cv,
         scoring="balanced_accuracy",
-        n_jobs=1
+        n_jobs=-1,
+        refit=True,
     )
 
     grid_search.fit(x_train, y_train)
-    return grid_search
 
+    # Paso 5: Guardar modelo comprimido
+    os.makedirs("files/models", exist_ok=True)
+    with gzip.open("files/models/model.pkl.gz", "wb") as f:
+        pickle.dump(grid_search, f)
 
-def save_model(model, filename="files/models/model.pkl.gz"):
-    """
-    Paso 5: Save model compressed with gzip
-    """
-    os.makedirs(os.path.dirname(filename), exist_ok=True)
-    with gzip.open(filename, "wb") as f:
-        pickle.dump(model, f)
-
-
-def calculate_metrics(model, x_train, y_train, x_test, y_test):
-    """
-    Paso 6 y 7: Calculate metrics and confusion matrix, save to JSON
-    """
-    metrics_list = []
-
-    # Predictions
-    y_train_pred = model.predict(x_train)
-    y_test_pred = model.predict(x_test)
-
-    # Train metrics
-    train_metrics = {
-        "type": "metrics",
-        "dataset": "train",
-        "precision": precision_score(y_train, y_train_pred),
-        "balanced_accuracy": balanced_accuracy_score(y_train, y_train_pred),
-        "recall": recall_score(y_train, y_train_pred),
-        "f1_score": f1_score(y_train, y_train_pred)
-    }
-    metrics_list.append(train_metrics)
-
-    # Test metrics
-    test_metrics = {
-        "type": "metrics",
-        "dataset": "test",
-        "precision": precision_score(y_test, y_test_pred),
-        "balanced_accuracy": balanced_accuracy_score(y_test, y_test_pred),
-        "recall": recall_score(y_test, y_test_pred),
-        "f1_score": f1_score(y_test, y_test_pred)
-    }
-    metrics_list.append(test_metrics)
-
-    # Confusion matrices
-    cm_train = confusion_matrix(y_train, y_train_pred)
-    cm_test = confusion_matrix(y_test, y_test_pred)
-
-    train_cm = {
-        "type": "cm_matrix",
-        "dataset": "train",
-        "true_0": {"predicted_0": int(cm_train[0, 0]), "predicted_1": None},
-        "true_1": {"predicted_0": None, "predicted_1": int(cm_train[1, 1])}
-    }
-    metrics_list.append(train_cm)
-
-    test_cm = {
-        "type": "cm_matrix",
-        "dataset": "test",
-        "true_0": {"predicted_0": int(cm_test[0, 0]), "predicted_1": None},
-        "true_1": {"predicted_0": None, "predicted_1": int(cm_test[1, 1])}
-    }
-    metrics_list.append(test_cm)
-
-    # Save to JSON
+    # Paso 6 y 7: Calcular métricas y matrices de confusión
     os.makedirs("files/output", exist_ok=True)
-    with open("files/output/metrics.json", "w") as f:
-        for metric in metrics_list:
-            f.write(json.dumps(metric) + "\n")
 
+    metrics = []
 
-def run():
-    """Execute the full pipeline"""
-    # Clean data
-    train_data, test_data = clean_campaign_data()
+    # Métricas de clasificación
+    for dataset, x, y in [("train", x_train, y_train), ("test", x_test, y_test)]:
+        y_pred = grid_search.predict(x)
+        metrics.append(
+            {
+                "type": "metrics",
+                "dataset": dataset,
+                "precision": round(float(precision_score(y, y_pred, zero_division=0)), 3),
+                "balanced_accuracy": round(float(balanced_accuracy_score(y, y_pred)), 3),
+                "recall": round(float(recall_score(y, y_pred, zero_division=0)), 3),
+                "f1_score": round(float(f1_score(y, y_pred, zero_division=0)), 3),
+            }
+        )
 
-    # Split into X and y
-    x_train = train_data.drop("default", axis=1)
-    y_train = train_data["default"]
-    x_test = test_data.drop("default", axis=1)
-    y_test = test_data["default"]
+    # Matrices de confusión
+    for dataset, x, y in [("train", x_train, y_train), ("test", x_test, y_test)]:
+        y_pred = grid_search.predict(x)
+        cm = confusion_matrix(y, y_pred)
+        metrics.append(
+            {
+                "type": "cm_matrix",
+                "dataset": dataset,
+                "true_0": {
+                    "predicted_0": int(cm[0, 0]),
+                    "predicted_1": int(cm[0, 1]),
+                },
+                "true_1": {
+                    "predicted_0": int(cm[1, 0]),
+                    "predicted_1": int(cm[1, 1]),
+                },
+            }
+        )
 
-    # Build and optimize pipeline
-    pipeline = build_pipeline()
-    model = optimize_hyperparameters(pipeline, x_train, y_train)
+    with open("files/output/metrics.json", "w", encoding="utf-8") as f:
+        for m in metrics:
+            f.write(json.dumps(m) + "\n")
 
-    # Save model
-    save_model(model)
-
-    # Calculate and save metrics
-    calculate_metrics(model, x_train, y_train, x_test, y_test)
-
-
-# Execute on import
-try:
-    run()
-except Exception as e:
-    import traceback
-    print(f"Error: {e}")
-    traceback.print_exc()
+if __name__ == "__main__":
+    main()

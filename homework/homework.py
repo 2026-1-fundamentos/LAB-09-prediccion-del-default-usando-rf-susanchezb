@@ -92,3 +92,195 @@
 # {'type': 'cm_matrix', 'dataset': 'train', 'true_0': {"predicted_0": 15562, "predicte_1": 666}, 'true_1': {"predicted_0": 3333, "predicted_1": 1444}}
 # {'type': 'cm_matrix', 'dataset': 'test', 'true_0': {"predicted_0": 15562, "predicte_1": 650}, 'true_1': {"predicted_0": 2490, "predicted_1": 1420}}
 #
+
+import gzip
+import json
+import os
+import pickle
+
+import pandas as pd
+from sklearn.compose import ColumnTransformer
+from sklearn.model_selection import GridSearchCV
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.pipeline import Pipeline
+from sklearn.metrics import precision_score, recall_score, f1_score, balanced_accuracy_score, confusion_matrix
+
+
+def clean_campaign_data():
+    """
+    Paso 1: Limpiar los datasets
+    """
+    # Load data
+    train_data = pd.read_csv("files/input/train_data.csv.zip")
+    test_data = pd.read_csv("files/input/test_data.csv.zip")
+
+    for idx, data in enumerate([train_data, test_data]):
+        # Rename target column
+        data = data.rename(columns={"default payment next month": "default"})
+
+        # Remove ID column
+        data = data.drop("ID", axis=1)
+
+        # Remove rows with missing values (N/A in MARRIAGE, EDUCATION)
+        data = data[(data["MARRIAGE"] != 0) & (data["EDUCATION"] != 0)]
+
+        # Group EDUCATION values > 4 as "others" (4 -> 4)
+        data = data.copy()
+        data.loc[data["EDUCATION"] > 4, "EDUCATION"] = 4
+
+        if idx == 0:
+            train_data = data
+        else:
+            test_data = data
+
+    return train_data, test_data
+
+
+def build_pipeline():
+    """
+    Paso 3: Create pipeline with OneHotEncoder and RandomForest
+    """
+    # Define categorical and numerical columns
+    categorical_cols = ["SEX", "EDUCATION", "MARRIAGE"]
+    numerical_cols = [col for col in ["LIMIT_BAL", "AGE", "PAY_0", "PAY_2", "PAY_3",
+                                       "PAY_4", "PAY_5", "PAY_6", "BILL_AMT1", "BILL_AMT2",
+                                       "BILL_AMT3", "BILL_AMT4", "BILL_AMT5", "BILL_AMT6",
+                                       "PAY_AMT1", "PAY_AMT2", "PAY_AMT3", "PAY_AMT4",
+                                       "PAY_AMT5", "PAY_AMT6"]]
+
+    # Create preprocessor
+    preprocessor = ColumnTransformer(
+        transformers=[
+            ("cat", OneHotEncoder(sparse_output=False), categorical_cols),
+            ("num", StandardScaler(), numerical_cols)
+        ])
+
+    # Create pipeline
+    pipeline = Pipeline(steps=[
+        ("preprocessor", preprocessor),
+        ("classifier", RandomForestClassifier(random_state=42))
+    ])
+
+    return pipeline
+
+
+def optimize_hyperparameters(pipeline, x_train, y_train):
+    """
+    Paso 4: Optimize hyperparameters using GridSearchCV with balanced_accuracy
+    """
+    param_grid = {
+        "classifier__n_estimators": [150, 250],
+        "classifier__max_depth": [18, 22],
+        "classifier__min_samples_split": [2, 4]
+    }
+
+    grid_search = GridSearchCV(
+        pipeline,
+        param_grid,
+        cv=10,
+        scoring="balanced_accuracy",
+        n_jobs=1
+    )
+
+    grid_search.fit(x_train, y_train)
+    return grid_search
+
+
+def save_model(model, filename="files/models/model.pkl.gz"):
+    """
+    Paso 5: Save model compressed with gzip
+    """
+    os.makedirs(os.path.dirname(filename), exist_ok=True)
+    with gzip.open(filename, "wb") as f:
+        pickle.dump(model, f)
+
+
+def calculate_metrics(model, x_train, y_train, x_test, y_test):
+    """
+    Paso 6 y 7: Calculate metrics and confusion matrix, save to JSON
+    """
+    metrics_list = []
+
+    # Predictions
+    y_train_pred = model.predict(x_train)
+    y_test_pred = model.predict(x_test)
+
+    # Train metrics
+    train_metrics = {
+        "type": "metrics",
+        "dataset": "train",
+        "precision": precision_score(y_train, y_train_pred),
+        "balanced_accuracy": balanced_accuracy_score(y_train, y_train_pred),
+        "recall": recall_score(y_train, y_train_pred),
+        "f1_score": f1_score(y_train, y_train_pred)
+    }
+    metrics_list.append(train_metrics)
+
+    # Test metrics
+    test_metrics = {
+        "type": "metrics",
+        "dataset": "test",
+        "precision": precision_score(y_test, y_test_pred),
+        "balanced_accuracy": balanced_accuracy_score(y_test, y_test_pred),
+        "recall": recall_score(y_test, y_test_pred),
+        "f1_score": f1_score(y_test, y_test_pred)
+    }
+    metrics_list.append(test_metrics)
+
+    # Confusion matrices
+    cm_train = confusion_matrix(y_train, y_train_pred)
+    cm_test = confusion_matrix(y_test, y_test_pred)
+
+    train_cm = {
+        "type": "cm_matrix",
+        "dataset": "train",
+        "true_0": {"predicted_0": int(cm_train[0, 0]), "predicted_1": None},
+        "true_1": {"predicted_0": None, "predicted_1": int(cm_train[1, 1])}
+    }
+    metrics_list.append(train_cm)
+
+    test_cm = {
+        "type": "cm_matrix",
+        "dataset": "test",
+        "true_0": {"predicted_0": int(cm_test[0, 0]), "predicted_1": None},
+        "true_1": {"predicted_0": None, "predicted_1": int(cm_test[1, 1])}
+    }
+    metrics_list.append(test_cm)
+
+    # Save to JSON
+    os.makedirs("files/output", exist_ok=True)
+    with open("files/output/metrics.json", "w") as f:
+        for metric in metrics_list:
+            f.write(json.dumps(metric) + "\n")
+
+
+def run():
+    """Execute the full pipeline"""
+    # Clean data
+    train_data, test_data = clean_campaign_data()
+
+    # Split into X and y
+    x_train = train_data.drop("default", axis=1)
+    y_train = train_data["default"]
+    x_test = test_data.drop("default", axis=1)
+    y_test = test_data["default"]
+
+    # Build and optimize pipeline
+    pipeline = build_pipeline()
+    model = optimize_hyperparameters(pipeline, x_train, y_train)
+
+    # Save model
+    save_model(model)
+
+    # Calculate and save metrics
+    calculate_metrics(model, x_train, y_train, x_test, y_test)
+
+
+# Execute on import
+try:
+    run()
+except Exception as e:
+    import traceback
+    print(f"Error: {e}")
+    traceback.print_exc()
